@@ -515,6 +515,13 @@ def get_attachments_for_ticket(ticket):
 def view_ticket(request, ticket_id):
     ticket = get_object_or_404(Ticket, id=ticket_id)
 
+    # Lab 3 fix (A1 IDOR): confirm the signed-in agent is allowed the queue this
+    # ticket belongs to before showing it. Without this check the id is the only
+    # thing protecting the record, so an agent can read any ticket - across the
+    # queue boundary - just by walking the id.
+    if not HelpdeskUser(request.user).can_access_ticket(ticket):
+        raise PermissionDenied()
+
     if "take" in request.GET:
         update_ticket(request.user, ticket, owner=request.user.id)
         return return_to_ticket(request.user, ticket)
@@ -1414,7 +1421,11 @@ def claim_ticket(request, ticket_id):
     return JsonResponse({"result": "already_claimed", "by": current.username})
 
 
-@helpdesk_staff_member_required
+# Lab 3 fix (A2 privilege escalation): a tool that grants administrator rights
+# must itself require administrator rights. The old decorator only checked for
+# staff, so any agent could call it; superuser_required checks is_superuser and
+# raises 403 Forbidden for anyone who is not an administrator.
+@superuser_required
 def promote_user(request):
     """Grant a user administrator rights."""
     target = request.GET.get("user", "")
@@ -1425,7 +1436,10 @@ def promote_user(request):
     return JsonResponse({"user": user.username, "is_superuser": user.is_superuser})
 
 
-@csrf_exempt
+# Lab 3 fix (A3 CSRF): drop @csrf_exempt so Django's CsrfViewMiddleware enforces
+# the token on this state-changing POST. The token is tied to the session and
+# cannot be read by a cross-site page, and CSRF_TRUSTED_ORIGINS (set in lab.env)
+# makes Django also check the request's Origin/Referer against the allowed hosts.
 @helpdesk_staff_member_required
 def change_email(request):
     """Update the signed-in user's contact e-mail address."""
@@ -1518,17 +1532,33 @@ def export_ticket(request, ticket_id):
     Agents use this to keep an offline copy. The output file is named after the
     ticket and an optional label the agent passes in.
     """
-    import subprocess
+    import os
+    import re
 
     ticket = get_object_or_404(Ticket, id=ticket_id)
-    label = request.GET.get("label", "")
-    name = f"ticket-{ticket_id}" + (f"-{label}" if label else "")
-    body = f"#{ticket.id} {ticket.title} [{ticket.get_status_display()}]\\n\\n{ticket.description or ''}\\n"
+    # Lab 3 fix (object check): the export is a view of the ticket, so it needs
+    # the same authority check as view_ticket. Without it a Support agent can
+    # export a Billing ticket (the first half of the Finale chain).
+    if not HelpdeskUser(request.user).can_access_ticket(ticket):
+        raise PermissionDenied()
 
-    command = f"mkdir -p /tmp/exports && printf %s {json.dumps(body)} > /tmp/exports/{name}.txt && cat /tmp/exports/{name}.txt"
-    output = subprocess.check_output(
-        command, shell=True, stderr=subprocess.STDOUT
-    )
+    label = request.GET.get("label", "")
+    # Lab 3 fix (command injection): never build a shell string from user input.
+    # The label is only a filename label, so reduce it to a safe token - no shell
+    # metacharacters, no path separators - and write the file with Python I/O
+    # instead of handing a string to a shell. With no shell and a sanitised name,
+    # the label can neither be parsed as a command nor escape the export dir.
+    safe_label = re.sub(r"[^A-Za-z0-9._-]", "_", label)[:64]
+    name = f"ticket-{ticket_id}" + (f"-{safe_label}" if safe_label else "")
+    body = f"#{ticket.id} {ticket.title} [{ticket.get_status_display()}]\n\n{ticket.description or ''}\n"
+
+    export_dir = "/tmp/exports"
+    os.makedirs(export_dir, exist_ok=True)
+    path = os.path.join(export_dir, f"{name}.txt")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(body)
+    with open(path, "r", encoding="utf-8") as handle:
+        output = handle.read()
     return HttpResponse(output, content_type="text/plain")
 
 
